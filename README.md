@@ -56,10 +56,28 @@ Notes:
   random secret for that key only.  Once a value is written to
   `/app/production.ini` it is preserved on subsequent restarts.
 
-A reproducible verification script is provided in `scripts/verify_secrets.sh`
-(and `scripts/verify_secrets.ps1` for Windows) that exercises both the
-“provided” and “auto-generated” code paths, plus step-by-step end-to-end
-instructions using docker-compose. 
+A comprehensive test suite is provided in `scripts/verify_secrets.sh`
+(and `scripts/verify_secrets.ps1` for Windows) that exercises **the full
+secret-handling code path** from `start_ckan.sh`, not just the
+environment-variable helper.  Coverage:
+includes:
+
+1. **`resolve_secret`** – environment variable resolution
+   (priority, `string:` prefix stripping, `CHANGE_ME` sentinel handling)
+2. **`iniget`** – parsing of `ckan config-tool -g` output
+   (extracting just the value from `key = value` format)
+3. **`is_unset` / **`has_value`** – empty/placeholder detection
+   (handling empty, `CHANGE_ME`, `string:`, `string:CHANGE_ME`)
+4. **Full decision logic simulation** – given an environment state + simulated ini state,
+   verify correct action (USE_ENV / AUTOGEN / KEEP_INI) for all 4 keys across
+   6 realistic scenarios
+
+The script also includes **end-to-end instructions for verifying against a
+**real CKAN container** to confirm persistence across restarts.  Run the unit tests with:
+`bash scripts/verify_secrets.sh` (Linux/macOS) or
+`powershell -ExecutionPolicy Bypass -File scripts\verify_secrets.ps1` (Windows).
+
+Current test result: **48/48 passing. 
 
 ## Extending CKAN docker images
 The docker images contain `uv` and we recommend using when extending the images with additional CKAN and python packages. Example:

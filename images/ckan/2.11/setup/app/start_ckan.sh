@@ -56,9 +56,37 @@ BEAKER_SECRET_VAL="$(resolve_secret CKAN___BEAKER__SESSION__SECRET BEAKER_SESSIO
 JWT_ENCODE_VAL="$(resolve_secret CKAN___API_TOKEN__JWT__ENCODE__SECRET JWT_ENCODE_SECRET)"
 JWT_DECODE_VAL="$(resolve_secret CKAN___API_TOKEN__JWT__DECODE__SECRET JWT_DECODE_SECRET)"
 
+# Extract just the value portion from "key = value" output of `ckan config-tool -g`.
+# Strips leading/trailing whitespace around the value.
 iniget() {
 	local key="$1"
-	ckan config-tool $APP_DIR/production.ini -g "$key" 2>/dev/null || true
+	local line
+	line="$(ckan config-tool $APP_DIR/production.ini -g "$key" 2>/dev/null || true)"
+	# Output format from ckan config-tool -g is:  "key = value"
+	# Strip everything up to and including " = " to get just the value.
+	local val="${line#* = }"
+	# Trim leading/trailing whitespace
+	val="${val#"${val%%[![:space:]]*}"}"
+	val="${val%"${val##*[![:space:]]}"}"
+	echo "$val"
+}
+
+# Check if a value from the ini is "empty/unset" for the purposes of secret
+# auto-generation. Returns 0 (true) if the value should be treated as "not
+# set" (i.e. empty string, placeholder, or empty string: prefix).
+is_unset() {
+	local val="$1"
+	[[ -z "$val" ]] && return 0
+	[[ "$val" == "CHANGE_ME" ]] && return 0
+	[[ "$val" == "string:" ]] && return 0
+	[[ "$val" == "string:CHANGE_ME" ]] && return 0
+	return 1
+}
+
+# Check if a value from the ini is "already set" (i.e. has a usable non-empty
+# non-placeholder value). This is the inverse of is_unset().
+has_value() {
+	! is_unset "$1"
 }
 
 # ---- beaker.session.secret ----
@@ -67,18 +95,20 @@ if [[ -n "$BEAKER_SECRET_VAL" ]]; then
 	ckan config-tool $APP_DIR/production.ini "beaker.session.secret=$BEAKER_SECRET_VAL"
 else
 	INI_BEAKER="$(iniget beaker.session.secret)"
-	if [[ -z "$INI_BEAKER" ]]; then
+	if has_value "$INI_BEAKER"; then
+		echo "[beaker.session.secret] Keeping value already present in ini"
+	else
 		echo "[beaker.session.secret] Not set, autogenerating"
 		BEAKER_SECRET_VAL="$(python -c 'import secrets; print(secrets.token_urlsafe())')"
 		ckan config-tool $APP_DIR/production.ini "beaker.session.secret=$BEAKER_SECRET_VAL"
-	else
-		echo "[beaker.session.secret] Keeping value already present in ini"
 	fi
 fi
 
 # ---- WTF_CSRF_SECRET_KEY (always regenerate alongside beaker if not set) ----
 INI_WTF="$(iniget WTF_CSRF_SECRET_KEY)"
-if [[ -z "$INI_WTF" ]]; then
+if has_value "$INI_WTF"; then
+	echo "[WTF_CSRF_SECRET_KEY] Keeping value already present in ini"
+else
 	echo "[WTF_CSRF_SECRET_KEY] Not set, autogenerating"
 	ckan config-tool $APP_DIR/production.ini "WTF_CSRF_SECRET_KEY=$(python -c 'import secrets; print(secrets.token_urlsafe())')"
 fi
@@ -89,12 +119,12 @@ if [[ -n "$JWT_ENCODE_VAL" ]]; then
 	ckan config-tool $APP_DIR/production.ini "api_token.jwt.encode.secret=string:$JWT_ENCODE_VAL"
 else
 	INI_JWT_ENCODE="$(iniget api_token.jwt.encode.secret)"
-	if [[ -z "$INI_JWT_ENCODE" || "$INI_JWT_ENCODE" == "string:" ]]; then
+	if has_value "$INI_JWT_ENCODE"; then
+		echo "[api_token.jwt.encode.secret] Keeping value already present in ini"
+	else
 		echo "[api_token.jwt.encode.secret] Not set, autogenerating"
 		JWT_ENCODE_VAL="$(python -c 'import secrets; print(secrets.token_urlsafe())')"
 		ckan config-tool $APP_DIR/production.ini "api_token.jwt.encode.secret=string:$JWT_ENCODE_VAL"
-	else
-		echo "[api_token.jwt.encode.secret] Keeping value already present in ini"
 	fi
 fi
 
@@ -104,7 +134,9 @@ if [[ -n "$JWT_DECODE_VAL" ]]; then
 	ckan config-tool $APP_DIR/production.ini "api_token.jwt.decode.secret=string:$JWT_DECODE_VAL"
 else
 	INI_JWT_DECODE="$(iniget api_token.jwt.decode.secret)"
-	if [[ -z "$INI_JWT_DECODE" || "$INI_JWT_DECODE" == "string:" ]]; then
+	if has_value "$INI_JWT_DECODE"; then
+		echo "[api_token.jwt.decode.secret] Keeping value already present in ini"
+	else
 		echo "[api_token.jwt.decode.secret] Not set, autogenerating"
 		if [[ -z "$JWT_DECODE_VAL" ]]; then
 			JWT_DECODE_VAL="$JWT_ENCODE_VAL"
@@ -113,8 +145,6 @@ else
 			JWT_DECODE_VAL="$(python -c 'import secrets; print(secrets.token_urlsafe())')"
 		fi
 		ckan config-tool $APP_DIR/production.ini "api_token.jwt.decode.secret=string:$JWT_DECODE_VAL"
-	else
-		echo "[api_token.jwt.decode.secret] Keeping value already present in ini"
 	fi
 fi
 
