@@ -28,7 +28,38 @@ docker compose build
 docker compose up -d
 ```
 
-Check if CKAN was succesfuly started on http://localhost:5000. 
+Check if CKAN was succesfuly started on http://localhost:5000.
+
+### Session / JWT Secrets (critical for production)
+The container needs three cryptographic secrets for session cookies and API
+token signing.  Set them in `compose/config/ckan/.env` **before** the first
+start, otherwise the container auto-generates fresh random values on every
+restart (which silently invalidates all existing sessions and tokens):
+
+| Variable (ckanext-envvars style, preferred) | Purpose | Example |
+|------|------|------|
+| `CKAN___BEAKER__SESSION__SECRET`         | Session cookie HMAC key        | `CKAN___BEAKER__SESSION__SECRET=s3cr3t-long-string` |
+| `CKAN___API_TOKEN__JWT__ENCODE__SECRET`  | Sign (encode) API tokens       | `CKAN___API_TOKEN__JWT__ENCODE__SECRET=string:my-jwt-key` |
+| `CKAN___API_TOKEN__JWT__DECODE__SECRET`  | Verify (decode) API tokens (in almost all cases set this to the **same** value as encode) | `CKAN___API_TOKEN__JWT__DECODE__SECRET=string:my-jwt-key` |
+
+Notes:
+- `string:` prefix on the two JWT variables is mandatory – it tells CKAN's
+  JWT layer to treat the value as a plain shared-secret rather than the
+  name of another config key.
+- The startup script also accepts the legacy bare names
+  `BEAKER_SESSION_SECRET`, `JWT_ENCODE_SECRET`, `JWT_DECODE_SECRET`
+  (without the `CKAN___*` prefix) for backwards compatibility, but the
+  names above are preferred because they are also honoured by the
+  `ckanext-envvars` plugin.
+- If you leave a variable unset, empty, or equal to the literal placeholder
+  `CHANGE_ME`, the container treats it as “not provided” and generates a
+  random secret for that key only.  Once a value is written to
+  `/app/production.ini` it is preserved on subsequent restarts.
+
+A reproducible verification script is provided in `scripts/verify_secrets.sh`
+(and `scripts/verify_secrets.ps1` for Windows) that exercises both the
+“provided” and “auto-generated” code paths, plus step-by-step end-to-end
+instructions using docker-compose. 
 
 ## Extending CKAN docker images
 The docker images contain `uv` and we recommend using when extending the images with additional CKAN and python packages. Example:

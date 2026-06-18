@@ -22,24 +22,100 @@ if [[ -d "${APP_DIR}/docker-entrypoint.d" ]]; then
 	done
 fi
 
-# Generate Beaker and JWT secrets from environment variables, if not present let CKAN auto generate them
-if [[ -z $BEAKER_SESSION_SECRET || -v $BEAKER_SESSION_SECRET || -z $JWT_ENCODE_SECRET || -v $JWT_ENCODE_SECRET || -z $JWT_DECODE_SECRET || -v $JWT_DECODE_SECRET ]]; then
-	echo "Missing BEAKER and JWT environment variables. Autogenerating secrets..."
+# Resolve each secret from environment variables.
+# Supports both naming conventions:
+#   - ckanext-envvars style (preferred, used in compose):
+#       CKAN___BEAKER__SESSION__SECRET
+#       CKAN___API_TOKEN__JWT__ENCODE__SECRET
+#       CKAN___API_TOKEN__JWT__DECODE__SECRET
+#   - legacy shell style (kept for backward compatibility):
+#       BEAKER_SESSION_SECRET
+#       JWT_ENCODE_SECRET
+#       JWT_DECODE_SECRET
+# Strips the "string:" prefix if present (ckanext-envvars convention).
+
+resolve_secret() {
+	local envvar_ckanstyle="$1"
+	local envvar_legacy="$2"
+	local val=""
+	if [[ -n "${!envvar_ckanstyle+x}" && -n "${!envvar_ckanstyle}" ]]; then
+		val="${!envvar_ckanstyle}"
+	elif [[ -n "${!envvar_legacy+x}" && -n "${!envvar_legacy}" ]]; then
+		val="${!envvar_legacy}"
+	fi
+	if [[ "$val" == string:* ]]; then
+		val="${val#string:}"
+	fi
+	if [[ "$val" == "CHANGE_ME" ]]; then
+		val=""
+	fi
+	echo "$val"
+}
+
+BEAKER_SECRET_VAL="$(resolve_secret CKAN___BEAKER__SESSION__SECRET BEAKER_SESSION_SECRET)"
+JWT_ENCODE_VAL="$(resolve_secret CKAN___API_TOKEN__JWT__ENCODE__SECRET JWT_ENCODE_SECRET)"
+JWT_DECODE_VAL="$(resolve_secret CKAN___API_TOKEN__JWT__DECODE__SECRET JWT_DECODE_SECRET)"
+
+iniget() {
+	local key="$1"
+	ckan config-tool $APP_DIR/production.ini -g "$key" 2>/dev/null || true
+}
+
+# ---- beaker.session.secret ----
+if [[ -n "$BEAKER_SECRET_VAL" ]]; then
+	echo "[beaker.session.secret] Using value from environment"
+	ckan config-tool $APP_DIR/production.ini "beaker.session.secret=$BEAKER_SECRET_VAL"
 else
-	echo "Setting session secrets from environment variables"
-	ckan config-tool $APP_DIR/production.ini "beaker.session.secret=$BEAKER_SESSION_SECRET"
-	ckan config-tool $APP_DIR/production.ini "api_token.jwt.encode.secret=$JWT_ENCODE_SECRET"
-	ckan config-tool $APP_DIR/production.ini "api_token.jwt.decode.secret=$JWT_DECODE_SECRET"
+	INI_BEAKER="$(iniget beaker.session.secret)"
+	if [[ -z "$INI_BEAKER" ]]; then
+		echo "[beaker.session.secret] Not set, autogenerating"
+		BEAKER_SECRET_VAL="$(python -c 'import secrets; print(secrets.token_urlsafe())')"
+		ckan config-tool $APP_DIR/production.ini "beaker.session.secret=$BEAKER_SECRET_VAL"
+	else
+		echo "[beaker.session.secret] Keeping value already present in ini"
+	fi
 fi
 
-# Autogenerating Beaker and JWT secrets
-if grep -E "beaker.session.secret ?= ?$" $APP_DIR/production.ini; then
-	echo "Setting secrets in ini file"
-	ckan config-tool $APP_DIR/production.ini "beaker.session.secret=$(python -c 'import secrets; print(secrets.token_urlsafe())')"
+# ---- WTF_CSRF_SECRET_KEY (always regenerate alongside beaker if not set) ----
+INI_WTF="$(iniget WTF_CSRF_SECRET_KEY)"
+if [[ -z "$INI_WTF" ]]; then
+	echo "[WTF_CSRF_SECRET_KEY] Not set, autogenerating"
 	ckan config-tool $APP_DIR/production.ini "WTF_CSRF_SECRET_KEY=$(python -c 'import secrets; print(secrets.token_urlsafe())')"
-	JWT_SECRET=$(python -c 'import secrets; print("string:" + secrets.token_urlsafe())')
-	ckan config-tool $APP_DIR/production.ini "api_token.jwt.encode.secret=$JWT_SECRET"
-	ckan config-tool $APP_DIR/production.ini "api_token.jwt.decode.secret=$JWT_SECRET"
+fi
+
+# ---- api_token.jwt.encode.secret ----
+if [[ -n "$JWT_ENCODE_VAL" ]]; then
+	echo "[api_token.jwt.encode.secret] Using value from environment (as string:*)"
+	ckan config-tool $APP_DIR/production.ini "api_token.jwt.encode.secret=string:$JWT_ENCODE_VAL"
+else
+	INI_JWT_ENCODE="$(iniget api_token.jwt.encode.secret)"
+	if [[ -z "$INI_JWT_ENCODE" || "$INI_JWT_ENCODE" == "string:" ]]; then
+		echo "[api_token.jwt.encode.secret] Not set, autogenerating"
+		JWT_ENCODE_VAL="$(python -c 'import secrets; print(secrets.token_urlsafe())')"
+		ckan config-tool $APP_DIR/production.ini "api_token.jwt.encode.secret=string:$JWT_ENCODE_VAL"
+	else
+		echo "[api_token.jwt.encode.secret] Keeping value already present in ini"
+	fi
+fi
+
+# ---- api_token.jwt.decode.secret ----
+if [[ -n "$JWT_DECODE_VAL" ]]; then
+	echo "[api_token.jwt.decode.secret] Using value from environment (as string:*)"
+	ckan config-tool $APP_DIR/production.ini "api_token.jwt.decode.secret=string:$JWT_DECODE_VAL"
+else
+	INI_JWT_DECODE="$(iniget api_token.jwt.decode.secret)"
+	if [[ -z "$INI_JWT_DECODE" || "$INI_JWT_DECODE" == "string:" ]]; then
+		echo "[api_token.jwt.decode.secret] Not set, autogenerating"
+		if [[ -z "$JWT_DECODE_VAL" ]]; then
+			JWT_DECODE_VAL="$JWT_ENCODE_VAL"
+		fi
+		if [[ -z "$JWT_DECODE_VAL" ]]; then
+			JWT_DECODE_VAL="$(python -c 'import secrets; print(secrets.token_urlsafe())')"
+		fi
+		ckan config-tool $APP_DIR/production.ini "api_token.jwt.decode.secret=string:$JWT_DECODE_VAL"
+	else
+		echo "[api_token.jwt.decode.secret] Keeping value already present in ini"
+	fi
 fi
 
 # Run the prerun script to init CKAN and create the default admin user
