@@ -59,25 +59,28 @@ Notes:
 A comprehensive test suite is provided in `scripts/verify_secrets.sh`
 (and `scripts/verify_secrets.ps1` for Windows) that exercises **the full
 secret-handling code path** from `start_ckan.sh`, not just the
-environment-variable helper.  Coverage:
-includes:
+environment-variable helper. Coverage includes:
 
 1. **`resolve_secret`** – environment variable resolution
    (priority, `string:` prefix stripping, `CHANGE_ME` sentinel handling)
-2. **`iniget`** – parsing of `ckan config-tool -g` output
-   (extracting just the value from `key = value` format)
-3. **`is_unset` / **`has_value`** – empty/placeholder detection
+2. **`iniget`** – value extraction from `production.ini` via
+   **plain `grep`+shell text parsing** (the same algorithm the startup
+   script actually uses – no reliance on any hypothetical CLI "read" subcommand)
+3. **`is_unset` / `has_value`** – empty/placeholder detection
    (handling empty, `CHANGE_ME`, `string:`, `string:CHANGE_ME`)
-4. **Full decision logic simulation** – given an environment state + simulated ini state,
-   verify correct action (USE_ENV / AUTOGEN / KEEP_INI) for all 4 keys across
-   6 realistic scenarios
+4. **Full E2E simulation** using REAL temp ini files:
+   - *Cold start* with `CHANGE_ME` env → all 4 keys auto-generated
+   - *Restart* against the same ini → all 4 values preserved byte-for-byte
+   - *Env override* with real `CKAN___*` values → overwrites ini
 
 The script also includes **end-to-end instructions for verifying against a
-**real CKAN container** to confirm persistence across restarts.  Run the unit tests with:
-`bash scripts/verify_secrets.sh` (Linux/macOS) or
-`powershell -ExecutionPolicy Bypass -File scripts\verify_secrets.ps1` (Windows).
+real CKAN container** using `grep` inside the container (the same
+mechanism the startup script itself uses to read the ini).
 
-Current test result: **48/48 passing. 
+Run the unit tests with:
+`bash scripts/verify_secrets.sh` (Linux/macOS) or
+`powershell -ExecutionPolicy Bypass -File scripts\verify_secrets.ps1`
+(Windows).  Current test result: **45/45 passing**. 
 
 ## Extending CKAN docker images
 The docker images contain `uv` and we recommend using when extending the images with additional CKAN and python packages. Example:

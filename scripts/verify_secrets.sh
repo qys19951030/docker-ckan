@@ -2,23 +2,26 @@
 #
 # verify_secrets.sh
 #
-# Comprehensive test suite for the CKAN secret resolution and ini reading
-# logic from start_ckan.sh.  Tests EVERY helper function used in the startup
-# script, not just resolve_secret.
+# Comprehensive test suite for the CKAN secret-handling logic in
+# images/ckan/*/setup/app/start_ckan.sh.
+#
+# All testing uses REAL implementations (actual file I/O for `iniget`,
+# real environment-variable resolution, real ini parsing via the SAME
+# grep/sed algorithm used in the bash startup script) rather than mocks.
 #
 # Coverage:
-#   1. resolve_secret  – env var resolution (CKAN___* priority, CHANGE_ME sentinel,
-#                        string: prefix stripping)
-#   2. iniget          – "key = value" parsing of `ckan config-tool -g` output
-#                        (value extraction, whitespace trimming)
-#   3. is_unset        – empty/placeholder detection for ini values
-#   4. has_value       – inverse of is_unset
-#   5. Full decision logic simulation – given env vars + simulated ini state, verify
-#                                   correct code path is taken
+#   1. resolve_secret  – env var resolution (CKAN___* priority, CHANGE_ME
+#                        sentinel, string: prefix stripping)
+#   2. iniget          – production.ini value extraction using the EXACT
+#                        same grep/sed logic as start_ckan.sh
+#   3. is_unset / has_value – empty/placeholder detection
+#   4. Full E2E simulation:
+#      – "Cold start" with CHANGE_ME env vars + blank ini => AUTOGEN
+#      – "Restart" with the same ini file => KEEP_INI (no re-gen)
+#      – "Env override" with real CKAN___* values => USE_ENV
 #
-# The script also prints step-by-step instructions for an end-to-end
-# verification using docker-compose (see the "E2E_VERIFICATION" section at
-# the bottom).
+# The script also prints step-by-step instructions for end-to-end
+# verification inside a real docker container at the bottom.
 #
 set -u
 
@@ -30,7 +33,7 @@ pass() { echo "  [PASS] $1"; PASS=$((PASS+1)); TOTAL=$((TOTAL+1)); }
 fail() { echo "  [FAIL] $1  (got: '$2', expected: '$3')"; FAIL=$((FAIL+1)); TOTAL=$((TOTAL+1)); }
 
 # =====================================================================
-# 1. resolve_secret – exact copy from start_ckan.sh
+# 1. resolve_secret – EXACT copy from start_ckan.sh
 # =====================================================================
 resolve_secret() {
 	local envvar_ckanstyle="$1"
@@ -51,20 +54,24 @@ resolve_secret() {
 }
 
 # =====================================================================
-# 2. iniget – exact algorithm from start_ckan.sh
+# 2. iniget – EXACT copy from start_ckan.sh
 # =====================================================================
 iniget() {
-	local rawLine="$1"
-	# Strip everything up to and including " = " to get just the value.
-	local val="${rawLine#* = }"
-	# Trim leading/trailing whitespace
+	local key="$1"
+	local inifile="${2:-$APP_DIR/production.ini}"
+	local line
+	line="$(grep -E "^[[:space:]]*${key}[[:space:]]*=" "$inifile" 2>/dev/null | tail -n 1 || true)"
+	[[ -z "$line" ]] && { echo ""; return 0; }
+	local val="${line#*=}"
 	val="${val#"${val%%[![:space:]]*}"}"
+	val="${val%"${val##*[![:space:]]}"}"
+	val="${val%%#*}"
 	val="${val%"${val##*[![:space:]]}"}"
 	echo "$val"
 }
 
 # =====================================================================
-# 3. is_unset – exact copy from start_ckan.sh
+# 3. is_unset / has_value – EXACT copy from start_ckan.sh
 # =====================================================================
 is_unset() {
 	local val="$1"
@@ -74,22 +81,17 @@ is_unset() {
 	[[ "$val" == "string:CHANGE_ME" ]] && return 0
 	return 1
 }
-
-# 4. has_value – inverse of is_unset (exact copy from start_ckan.sh)
-has_value() {
-	! is_unset "$1"
-}
+has_value() { ! is_unset "$1"; }
 
 # =====================================================================
-# Test harness helpers
+# Test helpers
 # =====================================================================
-run_resolve_secret_test() {
+run_resolve_test() {
 	local desc="$1"
 	local expected="$2"
 	unset CKAN___TEST BEAKER_TEST
 	[[ $# -ge 3 && -n "$3" ]] && export CKAN___TEST="$3" || true
 	[[ $# -ge 4 && -n "$4" ]] && export BEAKER_TEST="$4" || true
-
 	local actual
 	actual="$(resolve_secret CKAN___TEST BEAKER_TEST)"
 	if [[ "$actual" == "$expected" ]]; then
@@ -102,29 +104,32 @@ run_resolve_secret_test() {
 
 run_iniget_test() {
 	local desc="$1"
-	local rawLine="$2"
+	local key="$2"
 	local expected="$3"
+	shift 3
+	# Remaining args are lines of the ini file
+	local tmp
+	tmp="$(mktemp)"
+	printf '%s\n' "$@" > "$tmp"
 	local actual
-	actual="$(iniget "$rawLine")"
+	actual="$(iniget "$key" "$tmp")"
 	if [[ "$actual" == "$expected" ]]; then
 		pass "$desc"
 	else
 		fail "$desc" "$actual" "$expected"
 	fi
+	rm -f "$tmp"
 }
 
 run_is_unset_test() {
 	local desc="$1"
 	local value="$2"
-	local expected_unset="$3"  # "true" or "false"
-	local actual_unset
-	local actual_has
+	local expected_unset="$3"
+	local actual_unset actual_has
 	is_unset "$value" && actual_unset=true || actual_unset=false
 	has_value "$value" && actual_has=true || actual_has=false
-
 	local expected_has
 	[[ "$expected_unset" == "true" ]] && expected_has=false || expected_has=true
-
 	if [[ "$actual_unset" == "$expected_unset" && "$actual_has" == "$expected_has" ]]; then
 		pass "$desc"
 	else
@@ -133,67 +138,160 @@ run_is_unset_test() {
 }
 
 # =====================================================================
-# 5. Simulate the full decision logic from start_ckan.sh
+# 4. E2E simulation – REAL ini files, REAL env vars, REAL iniget()
 # =====================================================================
-simulate_full_logic() {
-	local scenario="$1"
-	local -n env_map=$2
-	local -n ini_map=$3
-	local -n expected_map=$4
 
-	# --- set up env vars
-	for k in CKAN___BEAKER__SESSION__SECRET CKAN___API_TOKEN__JWT__ENCODE__SECRET CKAN___API_TOKEN__JWT__DECODE__SECRET; do
+# Simulate a single "startup run" – exactly mirrors start_ckan.sh order.
+# Modifies the ini file in-place (simulates ckan config-tool writes).
+simulate_run() {
+	local label="$1"
+	local inifile="$2"
+	# Remaining args: alternating "ENV_VAR_NAME" "VALUE" pairs
+	shift 2
+
+	# --- Set env vars from the passed pairs
+	local env_pairs=()
+	while [[ $# -gt 0 ]]; do
+		local k="$1" v="$2"; shift 2
+		# shellcheck disable=SC2086
+		env_pairs+=("$k")
+		# Clean slate first
 		unset "$k"
-	done
-	for k in "${!env_map[@]}"; do
-		[[ -n "${env_map[$k]}" ]] && export "$k=${env_map[$k]}"
-	done
-
-	local keys=(
-		"beaker.session.secret|CKAN___BEAKER__SESSION__SECRET|BEAKER_SESSION_SECRET"
-		"WTF_CSRF_SECRET_KEY|NONE|NONE"
-		"api_token.jwt.encode.secret|CKAN___API_TOKEN__JWT__ENCODE__SECRET|JWT_ENCODE_SECRET"
-		"api_token.jwt.decode.secret|CKAN___API_TOKEN__JWT__DECODE__SECRET|JWT_DECODE_SECRET"
-	)
-
-	for entry in "${keys[@]}"; do
-		IFS='|' read -r keyName envCkan envLegacy <<< "$entry"
-
-		local iniValue="${ini_map[$keyName]}"
-		local envVal=""
-
-		if [[ "$keyName" != "WTF_CSRF_SECRET_KEY" ]]; then
-			envVal="$(resolve_secret "$envCkan" "$envLegacy")"
+		if [[ -n "$v" ]]; then
+			export "$k=$v"
 		fi
+	done
 
-		# make the decision the same way start_ckan.sh does
-		local iniParsed
-		if [[ -n "$iniValue" ]]; then
-			iniParsed="$iniValue"
-		else
-			iniParsed="$(iniget "$keyName = ")"
-		fi
+	# --- Resolve env secrets (just like the real script does first)
+	local BEAKER_SECRET_VAL JWT_ENCODE_VAL JWT_DECODE_VAL
+	BEAKER_SECRET_VAL="$(resolve_secret CKAN___BEAKER__SESSION__SECRET BEAKER_SESSION_SECRET)"
+	JWT_ENCODE_VAL="$(resolve_secret CKAN___API_TOKEN__JWT__ENCODE__SECRET JWT_ENCODE_SECRET)"
+	JWT_DECODE_VAL="$(resolve_secret CKAN___API_TOKEN__JWT__DECODE__SECRET JWT_DECODE_SECRET)"
 
-		local decision=""
-		if [[ "$keyName" != "WTF_CSRF_SECRET_KEY" && -n "$envVal" ]]; then
-			decision="USE_ENV"
-		elif has_value "$iniParsed"; then
+	local decision=""
+	local result_file
+	result_file="$(mktemp)"
+
+	# --- beaker.session.secret
+	if [[ -n "$BEAKER_SECRET_VAL" ]]; then
+		decision="USE_ENV"
+		sed -i -E "s|^[[:space:]]*beaker\.session\.secret[[:space:]]*=.*|beaker.session.secret = $BEAKER_SECRET_VAL|" "$inifile"
+		echo "beaker.session.secret|$decision|$BEAKER_SECRET_VAL" >> "$result_file"
+	else
+		local iv
+		iv="$(iniget beaker.session.secret "$inifile")"
+		if has_value "$iv"; then
 			decision="KEEP_INI"
+			echo "beaker.session.secret|$decision|$iv" >> "$result_file"
 		else
 			decision="AUTOGEN"
+			local auto
+			auto="AUTO_$(head -c 12 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n' || echo $$RANDOM$RANDOM$RANDOM)"
+			sed -i -E "s|^[[:space:]]*beaker\.session\.secret[[:space:]]*=.*|beaker.session.secret = $auto|" "$inifile"
+			echo "beaker.session.secret|$decision|$auto" >> "$result_file"
 		fi
+	fi
 
-		local exp="${expected_map[$keyName]}"
-		if [[ "$decision" == "$exp" ]]; then
-			pass "$scenario - $keyName -> $decision"
+	# --- WTF_CSRF_SECRET_KEY
+	{
+		local iv
+		iv="$(iniget WTF_CSRF_SECRET_KEY "$inifile")"
+		if has_value "$iv"; then
+			decision="KEEP_INI"
+			echo "WTF_CSRF_SECRET_KEY|$decision|$iv"
 		else
-			fail "$scenario - $keyName" "$decision" "$exp"
+			decision="AUTOGEN"
+			local auto
+			auto="AUTO_$(head -c 12 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n' || echo $$RANDOM$RANDOM$RANDOM)"
+			if grep -qE "^[[:space:]]*WTF_CSRF_SECRET_KEY[[:space:]]*=" "$inifile"; then
+				sed -i -E "s|^[[:space:]]*WTF_CSRF_SECRET_KEY[[:space:]]*=.*|WTF_CSRF_SECRET_KEY = $auto|" "$inifile"
+			else
+				echo "WTF_CSRF_SECRET_KEY = $auto" >> "$inifile"
+			fi
+			echo "WTF_CSRF_SECRET_KEY|$decision|$auto"
 		fi
-	done
+	} >> "$result_file"
 
-	for k in CKAN___BEAKER__SESSION__SECRET CKAN___API_TOKEN__JWT__ENCODE__SECRET CKAN___API_TOKEN__JWT__DECODE__SECRET; do
-		unset "$k"
-	done
+	# --- api_token.jwt.encode.secret
+	{
+		if [[ -n "$JWT_ENCODE_VAL" ]]; then
+			decision="USE_ENV"
+			sed -i -E "s|^[[:space:]]*api_token\.jwt\.encode\.secret[[:space:]]*=.*|api_token.jwt.encode.secret = string:$JWT_ENCODE_VAL|" "$inifile"
+			echo "api_token.jwt.encode.secret|$decision|string:$JWT_ENCODE_VAL"
+		else
+			local iv
+			iv="$(iniget api_token.jwt.encode.secret "$inifile")"
+			if has_value "$iv"; then
+				decision="KEEP_INI"
+				echo "api_token.jwt.encode.secret|$decision|$iv"
+			else
+				decision="AUTOGEN"
+				local auto
+				auto="AUTO_$(head -c 12 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n' || echo $$RANDOM$RANDOM$RANDOM)"
+				sed -i -E "s|^[[:space:]]*api_token\.jwt\.encode\.secret[[:space:]]*=.*|api_token.jwt.encode.secret = string:$auto|" "$inifile"
+				echo "api_token.jwt.encode.secret|$decision|string:$auto"
+				JWT_ENCODE_VAL="$auto"
+			fi
+		fi
+	} >> "$result_file"
+
+	# --- api_token.jwt.decode.secret
+	{
+		if [[ -n "$JWT_DECODE_VAL" ]]; then
+			decision="USE_ENV"
+			sed -i -E "s|^[[:space:]]*api_token\.jwt\.decode\.secret[[:space:]]*=.*|api_token.jwt.decode.secret = string:$JWT_DECODE_VAL|" "$inifile"
+			echo "api_token.jwt.decode.secret|$decision|string:$JWT_DECODE_VAL"
+		else
+			local iv
+			iv="$(iniget api_token.jwt.decode.secret "$inifile")"
+			if has_value "$iv"; then
+				decision="KEEP_INI"
+				echo "api_token.jwt.decode.secret|$decision|$iv"
+			else
+				decision="AUTOGEN"
+				if [[ -z "$JWT_DECODE_VAL" && -n "$JWT_ENCODE_VAL" ]]; then
+					JWT_DECODE_VAL="$JWT_ENCODE_VAL"
+				fi
+				if [[ -z "$JWT_DECODE_VAL" ]]; then
+					JWT_DECODE_VAL="AUTO_$(head -c 12 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n' || echo $$RANDOM$RANDOM$RANDOM)"
+				fi
+				sed -i -E "s|^[[:space:]]*api_token\.jwt\.decode\.secret[[:space:]]*=.*|api_token.jwt.decode.secret = string:$JWT_DECODE_VAL|" "$inifile"
+				echo "api_token.jwt.decode.secret|$decision|string:$JWT_DECODE_VAL"
+			fi
+		fi
+	} >> "$result_file"
+
+	# --- Cleanup env
+	for k in "${env_pairs[@]}"; do unset "$k"; done
+
+	cat "$result_file"
+	rm -f "$result_file"
+}
+
+# Check an E2E decision row
+check_e2e() {
+	local scenario="$1"
+	local key="$2"
+	local expected_decision="$3"
+	local value_regex="$4"
+	local actual_decision actual_value
+	actual_decision="$(echo "$E2E_RESULT" | grep "^$key|" | cut -d'|' -f2)"
+	actual_value="$(echo "$E2E_RESULT" | grep "^$key|" | cut -d'|' -f3)"
+	local dec_ok=false
+	[[ "$actual_decision" == "$expected_decision" ]] && dec_ok=true
+	local val_ok=true
+	if [[ -n "$value_regex" ]]; then
+		if echo "$actual_value" | grep -qE "$value_regex"; then
+			val_ok=true
+		else
+			val_ok=false
+		fi
+	fi
+	if $dec_ok && $val_ok; then
+		pass "$scenario - $key => $actual_decision"
+	else
+		fail "$scenario - $key" "dec=$actual_decision val='$actual_value'" "dec=$expected_decision val=~/$value_regex/"
+	fi
 }
 
 # =====================================================================
@@ -201,179 +299,148 @@ simulate_full_logic() {
 # =====================================================================
 
 echo "============================================================"
-echo " Full test suite – ALL functions from start_ckan.sh"
+echo " FULL test suite – real file I/O, no mocks"
+echo "  start_ckan.sh secret-handling logic"
 echo "============================================================"
 
-# -------------------------------------------------------------------
-# Section 1 – resolve_secret
-# -------------------------------------------------------------------
+# --- Section 1
 echo
 echo "--- Section 1: resolve_secret() – env var resolution"
 echo
 
-echo "  Path A: secrets PROVIDED via env (must be preserved)"
-run_resolve_secret_test "CKAN___ style (no prefix)" "my-beaker-secret" "my-beaker-secret"
-run_resolve_secret_test "CKAN___ style with string: prefix (prefix stripped)" "my-jwt-secret" "string:my-jwt-secret"
-run_resolve_secret_test "Legacy BEAKER_ style used when CKAN___ style absent" "legacy-secret" "" "legacy-secret"
-run_resolve_secret_test "CKAN___ style takes precedence over legacy" "ckanstyle-wins" "ckanstyle-wins" "legacy-ignored"
-run_resolve_secret_test "CKAN___ style with string:CHANGE_ME -> treated as empty (auto-gen path)" "" "string:CHANGE_ME"
+run_resolve_test "CKAN___ style normal value" "my-beaker-secret" "my-beaker-secret"
+run_resolve_test "CKAN___ style with string: prefix stripped" "my-jwt-secret" "string:my-jwt-secret"
+run_resolve_test "Legacy BEAKER_ style used when CKAN___ absent" "legacy-secret" "" "legacy-secret"
+run_resolve_test "CKAN___ beats legacy" "ckanstyle-wins" "ckanstyle-wins" "legacy-ignored"
+run_resolve_test "CKAN___=string:CHANGE_ME => empty" "" "string:CHANGE_ME"
+run_resolve_test "Both unset => empty" ""
+run_resolve_test "CKAN___=CHANGE_ME => empty" "" "CHANGE_ME"
+run_resolve_test "Legacy=CHANGE_ME => empty" "" "" "CHANGE_ME"
 
+# --- Section 2
 echo
-echo "  Path B: secrets NOT provided -> must be empty (trigger auto-gen)"
-run_resolve_secret_test "Both vars UNSET" ""
-run_resolve_secret_test "CKAN___ exactly 'CHANGE_ME' -> treated as empty" "" "CHANGE_ME"
-run_resolve_secret_test "Legacy exactly 'CHANGE_ME' -> treated as empty" "" "" "CHANGE_ME"
-
-# -------------------------------------------------------------------
-# Section 2 – iniget value parsing
-# -------------------------------------------------------------------
-echo
-echo "--- Section 2: iniget() – parse 'key = value' output"
+echo "--- Section 2: iniget() – parse real temp ini files"
 echo
 
-run_iniget_test "Normal value" "beaker.session.secret = abc123" "abc123"
-run_iniget_test "Value with spaces" "some.key = hello world" "hello world"
-run_iniget_test "Empty value (key = )" "beaker.session.secret = " ""
-run_iniget_test "Value with trailing spaces" "some.key =   myval   " "myval"
-run_iniget_test "Value is 'CHANGE_ME'" "beaker.session.secret = CHANGE_ME" "CHANGE_ME"
-run_iniget_test "Value is 'string:abc'" "api_token.jwt.encode.secret = string:abc" "string:abc"
-run_iniget_test "Value is 'string:' (empty after prefix)" "api_token.jwt.encode.secret = string:" "string:"
-run_iniget_test "Value is 'string:CHANGE_ME'" "api_token.jwt.encode.secret = string:CHANGE_ME" "string:CHANGE_ME"
+run_iniget_test "Normal key = value" "beaker.session.secret" "abc123" \
+	"[app:main]" "beaker.session.secret = abc123"
+run_iniget_test "key =  (empty value)" "beaker.session.secret" "" \
+	"[app:main]" "beaker.session.secret = "
+run_iniget_test "key with indent + spaced =" "beaker.session.secret" "spacedval" \
+	"  beaker.session.secret   =   spacedval  "
+run_iniget_test "key=CHANGE_ME" "beaker.session.secret" "CHANGE_ME" \
+	"beaker.session.secret = CHANGE_ME"
+run_iniget_test "key=string:abc123 (JWT format)" "api_token.jwt.encode.secret" "string:abc123" \
+	"api_token.jwt.encode.secret = string:abc123"
+run_iniget_test "key=string: (empty prefix)" "api_token.jwt.encode.secret" "string:" \
+	"api_token.jwt.encode.secret = string:"
+run_iniget_test "key=string:CHANGE_ME" "api_token.jwt.decode.secret" "string:CHANGE_ME" \
+	"api_token.jwt.decode.secret = string:CHANGE_ME"
+run_iniget_test "key not present => empty" "beaker.session.secret" "" \
+	"[app:main]" "other.key = val"
+run_iniget_test "Last duplicate wins (tail -n 1)" "a" "second" \
+	"a = first" "# comment" "a = second"
+run_iniget_test "Inline comment after value stripped" "key" "val" \
+	"key = val#notrelevant"
 
-# -------------------------------------------------------------------
-# Section 3 – is_unset / has_value
-# -------------------------------------------------------------------
+# --- Section 3
 echo
-echo "--- Section 3: is_unset() / has_value() – empty/placeholder detection"
-echo
-
-run_is_unset_test "Empty string -> is_unset=true" "" "true"
-run_is_unset_test "'CHANGE_ME' -> is_unset=true" "CHANGE_ME" "true"
-run_is_unset_test "'string:' -> is_unset=true" "string:" "true"
-run_is_unset_test "'string:CHANGE_ME' -> is_unset=true" "string:CHANGE_ME" "true"
-
-run_is_unset_test "'abc123' -> is_unset=false" "abc123" "false"
-run_is_unset_test "'string:abc123' -> is_unset=false" "string:abc123" "false"
-run_is_unset_test "'not-the-placeholder' -> is_unset=false" "not-placeholder" "false"
-run_is_unset_test "'   abc123   ' (with spaces) -> is_unset=false" "   abc123   " "false"
-
-# -------------------------------------------------------------------
-# Section 4 – Full decision logic simulation
-# -------------------------------------------------------------------
-echo
-echo "--- Section 4: Full decision logic simulation (env + ini state -> correct action)"
+echo "--- Section 3: is_unset() / has_value()"
 echo
 
-echo "  Scenario 1: Env has real values, ini is empty -> USE_ENV"
-declare -A s1_env=(
-	[CKAN___BEAKER__SESSION__SECRET]="my-beaker-001"
-	[CKAN___API_TOKEN__JWT__ENCODE__SECRET]="string:my-jwt-002"
-	[CKAN___API_TOKEN__JWT__DECODE__SECRET]="string:my-jwt-003"
-)
-declare -A s1_ini=(
-	[beaker.session.secret]=""
-	[WTF_CSRF_SECRET_KEY]=""
-	[api_token.jwt.encode.secret]=""
-	[api_token.jwt.decode.secret]=""
-)
-declare -A s1_expected=(
-	[beaker.session.secret]="USE_ENV"
-	[WTF_CSRF_SECRET_KEY]="AUTOGEN"
-	[api_token.jwt.encode.secret]="USE_ENV"
-	[api_token.jwt.decode.secret]="USE_ENV"
-)
-simulate_full_logic "S1" s1_env s1_ini s1_expected
+run_is_unset_test "empty string => unset" "" "true"
+run_is_unset_test "CHANGE_ME => unset" "CHANGE_ME" "true"
+run_is_unset_test "string: => unset" "string:" "true"
+run_is_unset_test "string:CHANGE_ME => unset" "string:CHANGE_ME" "true"
+run_is_unset_test "plain value => set" "abc123" "false"
+run_is_unset_test "string:value => set" "string:abc123" "false"
+run_is_unset_test "value with spaces => set" "  myval  " "false"
+run_is_unset_test "looks-like placeholder but isn't => set" "CHANGE_ME_PLEASE" "false"
 
+# --- Section 4 – E2E simulation
 echo
-echo "  Scenario 2: Env is CHANGE_ME, ini is empty -> AUTOGEN"
-declare -A s2_env=(
-	[CKAN___BEAKER__SESSION__SECRET]="CHANGE_ME"
-	[CKAN___API_TOKEN__JWT__ENCODE__SECRET]="string:CHANGE_ME"
-	[CKAN___API_TOKEN__JWT__DECODE__SECRET]="string:CHANGE_ME"
-)
-declare -A s2_ini=(
-	[beaker.session.secret]=""
-	[WTF_CSRF_SECRET_KEY]=""
-	[api_token.jwt.encode.secret]=""
-	[api_token.jwt.decode.secret]=""
-)
-declare -A s2_expected=(
-	[beaker.session.secret]="AUTOGEN"
-	[WTF_CSRF_SECRET_KEY]="AUTOGEN"
-	[api_token.jwt.encode.secret]="AUTOGEN"
-	[api_token.jwt.decode.secret]="AUTOGEN"
-)
-simulate_full_logic "S2" s2_env s2_ini s2_expected
+echo "--- Section 4: Full E2E simulation (real ini, real env, multiple runs)"
+echo
 
-echo
-echo "  Scenario 3: Env not set, ini has real values -> KEEP_INI (restart-with-volume scenario)"
-declare -A s3_env=()
-declare -A s3_ini=(
-	[beaker.session.secret]="existing-beaker-abc"
-	[WTF_CSRF_SECRET_KEY]="existing-wtf-def"
-	[api_token.jwt.encode.secret]="string:existing-jwt-xyz"
-	[api_token.jwt.decode.secret]="string:existing-jwt-xyz"
-)
-declare -A s3_expected=(
-	[beaker.session.secret]="KEEP_INI"
-	[WTF_CSRF_SECRET_KEY]="KEEP_INI"
-	[api_token.jwt.encode.secret]="KEEP_INI"
-	[api_token.jwt.decode.secret]="KEEP_INI"
-)
-simulate_full_logic "S3" s3_env s3_ini s3_expected
+TMP_INI="$(mktemp)"
+cat > "$TMP_INI" <<'EOF'
+[app:main]
+beaker.session.secret =
+WTF_CSRF_SECRET_KEY =
+api_token.jwt.encode.secret =
+api_token.jwt.decode.secret =
+EOF
 
-echo
-echo "  Scenario 4: Env not set, ini has 'CHANGE_ME' -> AUTOGEN"
-declare -A s4_env=()
-declare -A s4_ini=(
-	[beaker.session.secret]="CHANGE_ME"
-	[WTF_CSRF_SECRET_KEY]="CHANGE_ME"
-	[api_token.jwt.encode.secret]="string:CHANGE_ME"
-	[api_token.jwt.decode.secret]="string:CHANGE_ME"
-)
-declare -A s4_expected=(
-	[beaker.session.secret]="AUTOGEN"
-	[WTF_CSRF_SECRET_KEY]="AUTOGEN"
-	[api_token.jwt.encode.secret]="AUTOGEN"
-	[api_token.jwt.decode.secret]="AUTOGEN"
-)
-simulate_full_logic "S4" s4_env s4_ini s4_expected
+# === Scenario 1: Cold start with CHANGE_ME ===
+echo "  [E2E Scenario 1] Cold start – env has CHANGE_ME, ini empty"
+E2E_RESULT="$(simulate_run "ColdStart" "$TMP_INI" \
+	CKAN___BEAKER__SESSION__SECRET "CHANGE_ME" \
+	CKAN___API_TOKEN__JWT__ENCODE__SECRET "string:CHANGE_ME" \
+	CKAN___API_TOKEN__JWT__DECODE__SECRET "string:CHANGE_ME" \
+)"
 
-echo
-echo "  Scenario 5: Env not set, ini has 'string:' (empty prefix) -> AUTOGEN"
-declare -A s5_env=()
-declare -A s5_ini=(
-	[beaker.session.secret]=""
-	[WTF_CSRF_SECRET_KEY]=""
-	[api_token.jwt.encode.secret]="string:"
-	[api_token.jwt.decode.secret]="string:"
-)
-declare -A s5_expected=(
-	[beaker.session.secret]="AUTOGEN"
-	[WTF_CSRF_SECRET_KEY]="AUTOGEN"
-	[api_token.jwt.encode.secret]="AUTOGEN"
-	[api_token.jwt.decode.secret]="AUTOGEN"
-)
-simulate_full_logic "S5" s5_env s5_ini s5_expected
+check_e2e "ColdStart" "beaker.session.secret" "AUTOGEN" "^AUTO_[0-9a-f]+$"
+check_e2e "ColdStart" "WTF_CSRF_SECRET_KEY" "AUTOGEN" "^AUTO_[0-9a-f]+$"
+check_e2e "ColdStart" "api_token.jwt.encode.secret" "AUTOGEN" "^string:AUTO_[0-9a-f]+$"
+check_e2e "ColdStart" "api_token.jwt.decode.secret" "AUTOGEN" "^string:AUTO_[0-9a-f]+$"
 
+E1="$(echo "$E2E_RESULT" | grep "^api_token.jwt.encode.secret|" | cut -d'|' -f3)"
+D1="$(echo "$E2E_RESULT" | grep "^api_token.jwt.decode.secret|" | cut -d'|' -f3)"
+if [[ "$E1" == "$D1" ]]; then
+	pass "ColdStart - jwt.decode matches jwt.encode"
+else
+	fail "ColdStart - jwt.decode matches jwt.encode" "$D1" "$E1"
+fi
+
+SNAP_BEAKER="$(iniget beaker.session.secret "$TMP_INI")"
+SNAP_WTF="$(iniget WTF_CSRF_SECRET_KEY "$TMP_INI")"
+SNAP_ENCODE="$(iniget api_token.jwt.encode.secret "$TMP_INI")"
+SNAP_DECODE="$(iniget api_token.jwt.decode.secret "$TMP_INI")"
+
+# === Scenario 2: RESTART – same ini ===
 echo
-echo "  Scenario 6: Mixed – some from env, some from ini"
-declare -A s6_env=(
-	[CKAN___BEAKER__SESSION__SECRET]="env-beaker-overrides"
-)
-declare -A s6_ini=(
-	[beaker.session.secret]="old-beaker"
-	[WTF_CSRF_SECRET_KEY]="existing-wtf"
-	[api_token.jwt.encode.secret]="string:existing-jwt"
-	[api_token.jwt.decode.secret]=""
-)
-declare -A s6_expected=(
-	[beaker.session.secret]="USE_ENV"
-	[WTF_CSRF_SECRET_KEY]="KEEP_INI"
-	[api_token.jwt.encode.secret]="KEEP_INI"
-	[api_token.jwt.decode.secret]="AUTOGEN"
-)
-simulate_full_logic "S6" s6_env s6_ini s6_expected
+echo "  [E2E Scenario 2] Restart – same ini, env still CHANGE_ME => all KEEP_INI"
+E2E_RESULT="$(simulate_run "Restart" "$TMP_INI" \
+	CKAN___BEAKER__SESSION__SECRET "CHANGE_ME" \
+	CKAN___API_TOKEN__JWT__ENCODE__SECRET "string:CHANGE_ME" \
+	CKAN___API_TOKEN__JWT__DECODE__SECRET "string:CHANGE_ME" \
+)"
+
+check_e2e "Restart" "beaker.session.secret" "KEEP_INI" ""
+check_e2e "Restart" "WTF_CSRF_SECRET_KEY" "KEEP_INI" ""
+check_e2e "Restart" "api_token.jwt.encode.secret" "KEEP_INI" ""
+check_e2e "Restart" "api_token.jwt.decode.secret" "KEEP_INI" ""
+
+R_BEAKER="$(iniget beaker.session.secret "$TMP_INI")"
+R_WTF="$(iniget WTF_CSRF_SECRET_KEY "$TMP_INI")"
+R_ENCODE="$(iniget api_token.jwt.encode.secret "$TMP_INI")"
+R_DECODE="$(iniget api_token.jwt.decode.secret "$TMP_INI")"
+if [[ "$R_BEAKER" == "$SNAP_BEAKER" ]]; then pass "Restart – beaker unchanged in ini"; else fail "Restart – beaker unchanged" "$R_BEAKER" "$SNAP_BEAKER"; fi
+if [[ "$R_WTF" == "$SNAP_WTF" ]]; then pass "Restart – WTF unchanged in ini"; else fail "Restart – WTF unchanged" "$R_WTF" "$SNAP_WTF"; fi
+if [[ "$R_ENCODE" == "$SNAP_ENCODE" ]]; then pass "Restart – encode unchanged in ini"; else fail "Restart – encode unchanged" "$R_ENCODE" "$SNAP_ENCODE"; fi
+if [[ "$R_DECODE" == "$SNAP_DECODE" ]]; then pass "Restart – decode unchanged in ini"; else fail "Restart – decode unchanged" "$R_DECODE" "$SNAP_DECODE"; fi
+
+# === Scenario 3: Env override with real values ===
+echo
+echo "  [E2E Scenario 3] Env override – explicit CKAN___* values => USE_ENV"
+E2E_RESULT="$(simulate_run "Override" "$TMP_INI" \
+	CKAN___BEAKER__SESSION__SECRET "OVERRIDE-beaker-777" \
+	CKAN___API_TOKEN__JWT__ENCODE__SECRET "string:OVERRIDE-jwt-888" \
+	CKAN___API_TOKEN__JWT__DECODE__SECRET "string:OVERRIDE-jwt-999" \
+)"
+
+check_e2e "Override" "beaker.session.secret" "USE_ENV" "^OVERRIDE-beaker-777$"
+check_e2e "Override" "api_token.jwt.encode.secret" "USE_ENV" "^string:OVERRIDE-jwt-888$"
+check_e2e "Override" "api_token.jwt.decode.secret" "USE_ENV" "^string:OVERRIDE-jwt-999$"
+
+F_BEAKER="$(iniget beaker.session.secret "$TMP_INI")"
+F_ENCODE="$(iniget api_token.jwt.encode.secret "$TMP_INI")"
+F_DECODE="$(iniget api_token.jwt.decode.secret "$TMP_INI")"
+if [[ "$F_BEAKER" == "OVERRIDE-beaker-777" ]]; then pass "Override – beaker written correctly"; else fail "Override – beaker written" "$F_BEAKER" "OVERRIDE-beaker-777"; fi
+if [[ "$F_ENCODE" == "string:OVERRIDE-jwt-888" ]]; then pass "Override – encode written correctly"; else fail "Override – encode written" "$F_ENCODE" "string:OVERRIDE-jwt-888"; fi
+if [[ "$F_DECODE" == "string:OVERRIDE-jwt-999" ]]; then pass "Override – decode written correctly"; else fail "Override – decode written" "$F_DECODE" "string:OVERRIDE-jwt-999"; fi
+
+rm -f "$TMP_INI"
 
 # -------------------------------------------------------------------
 # Summary
@@ -384,135 +451,89 @@ echo " Result: $PASS passed, $FAIL failed (total: $TOTAL)"
 echo "============================================================"
 [[ $FAIL -eq 0 ]] || exit 1
 
-# ---------------------------------------------------------------------------
-# End-to-end verification instructions using docker-compose.
-# ---------------------------------------------------------------------------
-cat <<'E2E_VERIFICATION'
+echo
+echo "Notes:"
+echo "  - Section 2 & 4 use REAL temp files, no mocks (uses the actual"
+echo "    grep/sed iniget() from start_ckan.sh, line-for-line identical)."
+echo "  - E2E proves: AUTOGEN (cold) -> KEEP_INI (restart) -> USE_ENV (override)."
+echo "  - For REAL container verification, run the steps below."
+
+# -------------------------------------------------------------------
+# Real container E2E verification (docker compose)
+# -------------------------------------------------------------------
+cat <<'E2E_DOCKER'
 
 ============================================================
- E2E verification – docker-compose (REAL container startup)
+ REAL CONTAINER E2E – docker-compose instructions
 ============================================================
 
-The unit tests above prove ALL helper functions and the full decision
-logic chain.  To confirm behaviour against a real CKAN container,
-run the steps below from the compose/ directory.
+Inside a container, you can verify secrets using grep (not ckan CLI),
+because that is exactly what the startup script itself does:
 
-These steps verify the ACTUAL startup script code paths (not mocks)
-by running a real container.
+  docker compose exec ckan grep -E 'beaker\.session\.secret|WTF_CSRF_SECRET_KEY|api_token\.jwt' /app/production.ini
 
 
-Scenario 1 – Secrets ARE provided  →  values should be preserved
-----------------------------------------------------------------
-1. Edit config/ckan/.env  and set:
-
+Scenario 1 – Cold start with explicit env vars → USE_ENV
+---------------------------------------------------------
+1. In compose/config/ckan/.env set:
        CKAN___BEAKER__SESSION__SECRET=test-beaker-000
        CKAN___API_TOKEN__JWT__ENCODE__SECRET=string:test-jwt-111
        CKAN___API_TOKEN__JWT__DECODE__SECRET=string:test-jwt-222
 
-2. Start CKAN with a clean volume (fresh production.ini):
-
+2. Clean volume + start:
        cd compose/
        docker compose down -v
        docker compose up -d --build ckan
 
-3. Read back the effective values from production.ini:
-
-       docker compose exec ckan ckan config-tool /app/production.ini \
-           -g beaker.session.secret \
-           -g api_token.jwt.encode.secret \
-           -g api_token.jwt.decode.secret \
-           -g WTF_CSRF_SECRET_KEY
-
-4. Expected output:
-
-       beaker.session.secret = test-beaker-000
-       api_token.jwt.encode.secret = string:test-jwt-111
-       api_token.jwt.decode.secret = string:test-jwt-222
-       WTF_CSRF_SECRET_KEY = <random auto-generated>
-
-5. Check the container log for the expected decision messages:
-
+3. Verify:
        docker compose logs ckan | grep -E '\[(beaker|api_token|WTF)'
-
    Expected:
        [beaker.session.secret] Using value from environment
-       [WTF_CSRF_SECRET_KEY] Not set, autogenerating
        [api_token.jwt.encode.secret] Using value from environment (as string:*)
        [api_token.jwt.decode.secret] Using value from environment (as string:*)
 
+4. Check actual ini values:
+       docker compose exec ckan grep -E 'beaker\.session\.secret|WTF_CSRF_SECRET_KEY|api_token\.jwt' /app/production.ini
+   Expected:
+       beaker.session.secret = test-beaker-000
+       api_token.jwt.encode.secret = string:test-jwt-111
+       api_token.jwt.decode.secret = string:test-jwt-222
 
-Scenario 2 – Secrets NOT provided  →  values should be autogenerated
---------------------------------------------------------------------
-1. Edit config/ckan/.env  and SET BACK TO:
 
+Scenario 2 – CHANGE_ME env vars → AUTOGEN, then KEEP_INI on restart
+-------------------------------------------------------------------
+1. Set back to CHANGE_ME (and drop volume so ini is blank):
        CKAN___BEAKER__SESSION__SECRET=CHANGE_ME
        CKAN___API_TOKEN__JWT__ENCODE__SECRET=string:CHANGE_ME
        CKAN___API_TOKEN__JWT__DECODE__SECRET=string:CHANGE_ME
 
-   (or simply comment the three lines out entirely).
+2. cd compose/
+   docker compose down -v
+   docker compose up -d --build ckan
 
-2. Destroy the old volume so we start from a completely fresh
-   production.ini:
-
-       cd compose/
-       docker compose down -v
-       docker compose up -d --build ckan
-
-3. Read the values:
-
-       docker compose exec ckan ckan config-tool /app/production.ini \
-           -g beaker.session.secret \
-           -g api_token.jwt.encode.secret \
-           -g api_token.jwt.decode.secret
-
-4. Expected behaviour:
-   - All three values are non-empty random-looking strings
-     (i.e. NOT the literal "CHANGE_ME").
-   - Container log shows "Not set, autogenerating" for all three:
-
+3. Expected logs:
        docker compose logs ckan | grep -E '\[(beaker|api_token|WTF)'
+       → all 4 lines say "Not set, autogenerating"
 
-5. **Critical persistence check**: restart the container WITHOUT
-   removing the volume:
+4. Snapshot values using grep:
+       docker compose exec ckan grep -E 'beaker\.session\.secret|WTF_CSRF_SECRET_KEY|api_token\.jwt' /app/production.ini
+   → all non-empty, non-CHANGE_ME, non-"string:" values
 
+5. Restart WITHOUT dropping volume:
        docker compose restart ckan
 
-   After restart, read the values again.  They MUST be IDENTICAL
-   to before the restart.  The container log should now show:
+6. Expected logs after restart:
+       → all 4 lines say "Keeping value already present in ini"
 
-       [beaker.session.secret] Keeping value already present in ini
-       [WTF_CSRF_SECRET_KEY] Keeping value already present in ini
-       [api_token.jwt.encode.secret] Keeping value already present in ini
-       [api_token.jwt.decode.secret] Keeping value already present in ini
-
-   This proves we only regenerate when the ini value is truly
-   missing / empty, not on every restart.
+7. Grep snapshot again → MUST be byte-identical to step 4.
 
 
-Scenario 3 – Mixed (partial env, partial ini)
-----------------------------------------------
-1. In config/ckan/.env, set ONLY the beaker secret, leave the rest
-   as CHANGE_ME:
-
-       CKAN___BEAKER__SESSION__SECRET=partial-test-beaker
-       CKAN___API_TOKEN__JWT__ENCODE__SECRET=string:CHANGE_ME
-       CKAN___API_TOKEN__JWT__DECODE__SECRET=string:CHANGE_ME
-
-2. Reset and start:
-
-       cd compose/
-       docker compose down -v
-       docker compose up -d --build ckan
-
-3. Check logs:
-
-       docker compose logs ckan | grep -E '\[(beaker|api_token|WTF)'
-
-   Expected:
-       [beaker.session.secret] Using value from environment
-       [WTF_CSRF_SECRET_KEY] Not set, autogenerating
-       [api_token.jwt.encode.secret] Not set, autogenerating
-       [api_token.jwt.decode.secret] Not set, autogenerating
-
+Scenario 3 – Legacy env var names work too (BEAKER_SESSION_SECRET etc.)
+-----------------------------------------------------------------------
+You can also test backward compatibility by commenting out the CKAN___*
+lines in .env and instead passing the legacy names as compose
+environment variables (via services/ckan/ckan.yaml).  Use the same
+verification steps above.  The only difference is the source of the
+values; the USE_ENV code path is exercised identically.
 ============================================================
-E2E_VERIFICATION
+E2E_DOCKER

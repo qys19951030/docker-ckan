@@ -56,19 +56,38 @@ BEAKER_SECRET_VAL="$(resolve_secret CKAN___BEAKER__SESSION__SECRET BEAKER_SESSIO
 JWT_ENCODE_VAL="$(resolve_secret CKAN___API_TOKEN__JWT__ENCODE__SECRET JWT_ENCODE_SECRET)"
 JWT_DECODE_VAL="$(resolve_secret CKAN___API_TOKEN__JWT__DECODE__SECRET JWT_DECODE_SECRET)"
 
-# Extract just the value portion from "key = value" output of `ckan config-tool -g`.
-# Strips leading/trailing whitespace around the value.
+# Read the current value of a key from $APP_DIR/production.ini using plain
+# text parsing (grep + sed).  This avoids relying on any CKAN CLI "read"
+# subcommand that may or may not exist inside the image.
+# Output is the raw value of the key (empty string if the key is not found or
+# has no right-hand-side value). Leading/trailing whitespace around the value
+# is stripped.
 iniget() {
 	local key="$1"
+	local inifile="${2:-$APP_DIR/production.ini}"
+	# Grab the LAST matching "key = value" line (ini-style, allowing optional
+	# whitespace around "=" and optional trailing comment).  grep + sed are
+	# part of the base image and are guaranteed to exist.
 	local line
-	line="$(ckan config-tool $APP_DIR/production.ini -g "$key" 2>/dev/null || true)"
-	# Output format from ckan config-tool -g is:  "key = value"
-	# Strip everything up to and including " = " to get just the value.
-	local val="${line#* = }"
-	# Trim leading/trailing whitespace
+	line="$(grep -E "^[[:space:]]*${key}[[:space:]]*=" "$inifile" 2>/dev/null | tail -n 1 || true)"
+	[[ -z "$line" ]] && { echo ""; return 0; }
+	# Strip "key =" prefix, then strip surrounding whitespace
+	local val="${line#*=}"
 	val="${val#"${val%%[![:space:]]*}"}"
 	val="${val%"${val##*[![:space:]]}"}"
+	# Strip trailing inline comment if any (values that actually contain '#'
+	# for the secrets we manage is not a concern)
+	val="${val%%#*}"
+	val="${val%"${val##*[![:space:]]}"}"
 	echo "$val"
+}
+
+# Write a key=value pair into $APP_DIR/production.ini.
+# Uses `ckan config-tool` for writing (the SET path is well-documented and
+# works across CKAN 2.x); only the READ path was switched to grep/sed above.
+iniset() {
+	local keyval="$1"
+	ckan config-tool $APP_DIR/production.ini "$keyval"
 }
 
 # Check if a value from the ini is "empty/unset" for the purposes of secret
@@ -92,7 +111,7 @@ has_value() {
 # ---- beaker.session.secret ----
 if [[ -n "$BEAKER_SECRET_VAL" ]]; then
 	echo "[beaker.session.secret] Using value from environment"
-	ckan config-tool $APP_DIR/production.ini "beaker.session.secret=$BEAKER_SECRET_VAL"
+	iniset "beaker.session.secret=$BEAKER_SECRET_VAL"
 else
 	INI_BEAKER="$(iniget beaker.session.secret)"
 	if has_value "$INI_BEAKER"; then
@@ -100,7 +119,7 @@ else
 	else
 		echo "[beaker.session.secret] Not set, autogenerating"
 		BEAKER_SECRET_VAL="$(python -c 'import secrets; print(secrets.token_urlsafe())')"
-		ckan config-tool $APP_DIR/production.ini "beaker.session.secret=$BEAKER_SECRET_VAL"
+		iniset "beaker.session.secret=$BEAKER_SECRET_VAL"
 	fi
 fi
 
@@ -110,13 +129,13 @@ if has_value "$INI_WTF"; then
 	echo "[WTF_CSRF_SECRET_KEY] Keeping value already present in ini"
 else
 	echo "[WTF_CSRF_SECRET_KEY] Not set, autogenerating"
-	ckan config-tool $APP_DIR/production.ini "WTF_CSRF_SECRET_KEY=$(python -c 'import secrets; print(secrets.token_urlsafe())')"
+	iniset "WTF_CSRF_SECRET_KEY=$(python -c 'import secrets; print(secrets.token_urlsafe())')"
 fi
 
 # ---- api_token.jwt.encode.secret ----
 if [[ -n "$JWT_ENCODE_VAL" ]]; then
 	echo "[api_token.jwt.encode.secret] Using value from environment (as string:*)"
-	ckan config-tool $APP_DIR/production.ini "api_token.jwt.encode.secret=string:$JWT_ENCODE_VAL"
+	iniset "api_token.jwt.encode.secret=string:$JWT_ENCODE_VAL"
 else
 	INI_JWT_ENCODE="$(iniget api_token.jwt.encode.secret)"
 	if has_value "$INI_JWT_ENCODE"; then
@@ -124,14 +143,14 @@ else
 	else
 		echo "[api_token.jwt.encode.secret] Not set, autogenerating"
 		JWT_ENCODE_VAL="$(python -c 'import secrets; print(secrets.token_urlsafe())')"
-		ckan config-tool $APP_DIR/production.ini "api_token.jwt.encode.secret=string:$JWT_ENCODE_VAL"
+		iniset "api_token.jwt.encode.secret=string:$JWT_ENCODE_VAL"
 	fi
 fi
 
 # ---- api_token.jwt.decode.secret ----
 if [[ -n "$JWT_DECODE_VAL" ]]; then
 	echo "[api_token.jwt.decode.secret] Using value from environment (as string:*)"
-	ckan config-tool $APP_DIR/production.ini "api_token.jwt.decode.secret=string:$JWT_DECODE_VAL"
+	iniset "api_token.jwt.decode.secret=string:$JWT_DECODE_VAL"
 else
 	INI_JWT_DECODE="$(iniget api_token.jwt.decode.secret)"
 	if has_value "$INI_JWT_DECODE"; then
@@ -144,7 +163,7 @@ else
 		if [[ -z "$JWT_DECODE_VAL" ]]; then
 			JWT_DECODE_VAL="$(python -c 'import secrets; print(secrets.token_urlsafe())')"
 		fi
-		ckan config-tool $APP_DIR/production.ini "api_token.jwt.decode.secret=string:$JWT_DECODE_VAL"
+		iniset "api_token.jwt.decode.secret=string:$JWT_DECODE_VAL"
 	fi
 fi
 
